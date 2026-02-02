@@ -1,49 +1,49 @@
 #!/bin/bash
-
-# --- CONFIGURATION ---
-GRAFANA_URL="http://admin:MySecurePassword123!@localhost:3000"
-BUCKET_NAME="grafana-recovery"
-RESTORE_DIR="./restore_temp"
-
-echo "--- STARTING RECOVERY ---"
-
-# 1. Download from S3
-echo "⬇️  Downloading backup from S3..."
-mkdir -p $RESTORE_DIR
-aws s3 cp s3://$BUCKET_NAME/grafana-backup/ $RESTORE_DIR --recursive
-
-# 2. Wait for Grafana
-echo "⏳ Waiting for Grafana to wake up..."
-until curl -s -o /dev/null "$GRAFANA_URL/api/health"; do
-  echo "   - Grafana is sleeping... retrying in 5s"
-  sleep 5
-done
-echo "✅ Grafana is ONLINE!"
-
-# 3. Restore Data Sources
-echo "🔌 Restoring Data Sources..."
-if [ -f "$RESTORE_DIR/datasources.json" ]; then
-    jq -c '.[]' $RESTORE_DIR/datasources.json | while read i; do
-        curl -s -X POST -H "Content-Type: application/json" -d "$i" $GRAFANA_URL/api/datasources
-    done
-    echo "   - Data sources restored (duplicates are ignored)."
+set -e
+ 
+echo "===== GRAFANA RESTORE STARTED ====="
+ 
+# Load environment variables
+if [ -f .env ]; then
+  export $(grep -v '^#' .env | xargs)
 else
-    echo "   ⚠️ No datasources.json found in backup."
+  echo "❌ .env file not found"
+  exit 1
 fi
-
-# 4. Restore Dashboards (FIXED ID ISSUE)
-echo "📊 Restoring Dashboards..."
-for file in $RESTORE_DIR/dashboard_*.json; do
-    if [ -e "$file" ]; then
-        # FIX: We remove the internal 'id' so Grafana creates a fresh entry
-        jq '. | del(.id) | {"dashboard": ., "overwrite": true}' "$file" > temp_payload.json
-        
-        # Send to Grafana
-        curl -s -X POST -H "Content-Type: application/json" -d @temp_payload.json $GRAFANA_URL/api/dashboards/db
-        echo "   - Restored $(basename $file)"
-    fi
-done
-
-# 5. Cleanup
-rm -rf $RESTORE_DIR temp_payload.json
-echo "🎉 RECOVERY COMPLETE! Go check the UI."
+ 
+# Validate required variables
+if [ -z "$S3_BUCKET_NAME" ]; then
+  echo "❌ S3_BUCKET_NAME not set in .env"
+  exit 1
+fi
+ 
+# This MUST match docker-compose generated volume name
+GRAFANA_VOLUME="grafana-one-click-disaster-recovery-yashvi-prem_grafana-storage"
+ 
+# Get latest backup from S3
+LATEST_BACKUP=$(aws s3 ls s3://$S3_BUCKET_NAME/ | sort | tail -n 1 | awk '{print $4}')
+ 
+if [ -z "$LATEST_BACKUP" ]; then
+  echo "❌ No backup found in S3 bucket"
+  exit 1
+fi
+ 
+echo "Latest backup found: $LATEST_BACKUP"
+ 
+# Download backup
+aws s3 cp s3://$S3_BUCKET_NAME/$LATEST_BACKUP ./
+ 
+# Create Grafana volume (idempotent)
+docker volume create $GRAFANA_VOLUME >/dev/null
+ 
+echo "Restoring data into Grafana volume..."
+ 
+# Restore backup into the volume
+docker run --rm \
+  -v $GRAFANA_VOLUME:/var/lib/grafana \
+  -v $(pwd):/backup \
+  ubuntu \
+  bash -c "cd /var/lib/grafana && tar xzf /backup/$LATEST_BACKUP --strip-components=3"
+ 
+echo "Restore completed successfully"
+echo "===== GRAFANA RESTORE COMPLETED ====="
