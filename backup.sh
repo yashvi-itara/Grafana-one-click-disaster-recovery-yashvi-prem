@@ -1,35 +1,45 @@
 #!/bin/bash
-
-# --- CONFIGURATION ---
-GRAFANA_URL="http://admin:MySecurePassword123!@localhost:3000"
-BUCKET_NAME="grafana-recovery"  # <--- REPLACE THIS
-BACKUP_DIR="./backup_temp"
-
-echo "--- STARTING BACKUP ---"
-
-# 1. Prepare temp directory
-mkdir -p $BACKUP_DIR
-
-# 2. Backup Data Sources (The Connection)
-echo "🔌 Exporting Data Sources..."
-curl -s $GRAFANA_URL/api/datasources \
-  | jq '.' > $BACKUP_DIR/datasources.json
-
-# 3. Backup Dashboards (The Visuals)
-echo "📊 Exporting Dashboards..."
-# Get list of all dashboard UIDs
-for uid in $(curl -s $GRAFANA_URL/api/search | jq -r '.[].uid'); do
-    # Download specific dashboard JSON
-    curl -s $GRAFANA_URL/api/dashboards/uid/$uid \
-      | jq '.dashboard' > $BACKUP_DIR/dashboard_$uid.json
-    echo "   - Saved dashboard: $uid"
-done
-
-# 4. Upload to S3 (The Vault)
-echo "🚀 Uploading to S3..."
-aws s3 cp $BACKUP_DIR s3://$BUCKET_NAME/grafana-backup/ --recursive
-
-# 5. Cleanup
-rm -rf $BACKUP_DIR
-echo "✅ BACKUP COMPLETE! Files are in S3."
-
+set -e
+ 
+echo "===== GRAFANA BACKUP STARTED ====="
+ 
+# VARIABLES
+TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
+BACKUP_FILE="grafana-backup-$TIMESTAMP.tar.gz"
+S3_BUCKET="grafana-recovery-bucket"
+ 
+# CHECK AWS ACCESS
+echo "Checking AWS identity..."
+aws sts get-caller-identity
+ 
+# CHECK GRAFANA CONTAINER
+if ! docker ps | grep -q grafana; then
+  echo "Grafana container not running!"
+  exit 1
+fi
+ 
+# CREATE BACKUP INSIDE CONTAINER
+echo "Creating backup inside Grafana container..."
+docker exec grafana tar czf /tmp/$BACKUP_FILE /var/lib/grafana
+ 
+# COPY BACKUP TO HOST
+echo "Copying backup from container to host..."
+docker cp grafana:/tmp/$BACKUP_FILE ./
+ 
+# VERIFY FILE EXISTS
+if [ ! -f "$BACKUP_FILE" ]; then
+  echo "Backup file not found on host!"
+  exit 1
+fi
+ 
+# UPLOAD TO S3
+echo "Uploading backup to S3..."
+aws s3 cp $BACKUP_FILE s3://$S3_BUCKET/
+ 
+echo "Backup uploaded successfully!"
+ 
+# CLEANUP
+rm -f $BACKUP_FILE
+docker exec grafana rm -f /tmp/$BACKUP_FILE
+ 
+echo "===== GRAFANA BACKUP COMPLETED ====="
